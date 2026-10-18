@@ -5631,6 +5631,32 @@ namespace Jellyfin.Plugin.Ratings.Api
                     driveDevicePairs.Add((drive, device, mountPoint));
                 }
 
+                // In LXC containers, NTFS/FUSE mounts can be absent from
+                // DriveInfo.GetDrives() or classified as non-Fixed drives.
+                // Include the explicitly mounted /data volumes from /proc/mounts.
+                foreach (var mount in mountToDevice)
+                {
+                    var mountPoint = mount.Key;
+                    if (!mountPoint.StartsWith("/data/", StringComparison.Ordinal))
+                        continue;
+
+                    if (driveDevicePairs.Any(p => p.MountPoint == mountPoint))
+                        continue;
+
+                    try
+                    {
+                        var drive = new DriveInfo(mountPoint);
+                        if (!drive.IsReady || drive.TotalSize <= 0)
+                            continue;
+
+                        driveDevicePairs.Add((drive, mount.Value, mountPoint));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Unable to read mounted media volume {MountPoint}", mountPoint);
+                    }
+                }
+
                 // Group by device
                 var grouped = driveDevicePairs.GroupBy(p => p.Device).ToList();
 
