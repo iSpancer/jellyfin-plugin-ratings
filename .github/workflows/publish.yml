@@ -1,0 +1,107 @@
+name: Publish Jellyfin plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-jellyfin-plugin
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' Jellyfin.Plugin.Ratings.csproj | head -1)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid version"; exit 1; }
+          if node -e "const v=process.argv[1]; process.exit(require('./manifest.json')[0].versions.some(x=>x.version===v)?0:1)" "$version"; then
+            echo "::error::Version $version is already listed in manifest.json. Bump the .csproj version first."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=Jellyfin.Plugin.Ratings_$version.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          dotnet restore
+          dotnet build -c Release --no-restore -p:RequireMinification=true
+
+      - name: Package release and calculate MD5
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dll=bin/Release/net9.0/Jellyfin.Plugin.Ratings.dll
+          test -s "$dll"
+          zip -j "${{ steps.version.outputs.archive }}" "$dll"
+          md5=$(md5sum "${{ steps.version.outputs.archive }}" | cut -d' ' -f1)
+          echo "md5=$md5" >> "$GITHUB_OUTPUT"
+          unzip -l "${{ steps.version.outputs.archive }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            "${{ steps.version.outputs.archive }}" \
+            --target "${{ github.sha }}" \
+            --title "Ratings ${{ steps.version.outputs.version }}" \
+            --notes "Fix disk usage discovery for FUSE/NTFS media mounts in Proxmox LXC."
+
+      - name: Update manifest.json
+        env:
+          PLUGIN_VERSION: ${{ steps.version.outputs.version }}
+          ZIP_MD5: ${{ steps.package.outputs.md5 }}
+          REPO: ${{ github.repository }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = 'manifest.json';
+          const items = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const plugin = items[0];
+          if (plugin.versions.some(v => v.version === process.env.PLUGIN_VERSION)) {
+            throw new Error('Version already exists in manifest');
+          }
+          const release = {
+            version: process.env.PLUGIN_VERSION,
+            changelog: 'Fix disk usage detection for FUSE/NTFS drives in Proxmox LXC.',
+            targetAbi: '10.11.0.0',
+            sourceUrl: `https://github.com/${process.env.REPO}/releases/download/v${process.env.PLUGIN_VERSION}/Jellyfin.Plugin.Ratings_${process.env.PLUGIN_VERSION}.zip`,
+            checksum: process.env.ZIP_MD5,
+            timestamp: new Date().toISOString()
+          };
+          plugin.owner = 'iSpancer';
+          plugin.imageUrl = `https://raw.githubusercontent.com/${process.env.REPO}/main/images/logo.png`;
+          plugin.versions.unshift(release);
+          fs.writeFileSync(path, JSON.stringify(items, null, 2) + '\n');
+          NODE
+
+      - name: Commit manifest update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          git commit -m "Publish Ratings ${{ steps.version.outputs.version }} in manifest"
+          git push origin HEAD:main
